@@ -16,14 +16,16 @@
 
 package ratpack.session.clientside
 
+import com.google.common.collect.Maps
 import io.netty.handler.codec.http.Cookie
 import ratpack.registry.Registry
-import ratpack.session.clientside.serializer.JavaValueSerializer
-import ratpack.session.clientside.serializer.StringValueSerializer
+import ratpack.session.SessionAdapter
 import ratpack.session.store.SessionStorage
 import ratpack.test.internal.RatpackGroovyDslSpec
+import spock.lang.Ignore
 
 import java.time.Duration
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.stream.Collectors
 
 class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
@@ -90,7 +92,7 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
   def "cookies assigned to path are send for this path only"() {
     given:
     bindings {
-      module ClientSideSessionsModule, {
+      module NewClientSideSessionModule, {
         it.with {
           path = "/bar"
         }
@@ -98,27 +100,27 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
     }
 
     handlers {
-      get("foo") { SessionStorage sessionStorage ->
-        sessionStorage.get("value", String).then({
+      get("foo") { SessionAdapter session ->
+        session.get("value").then {
           render it.orElse("null")
-        })
+        }
       }
-      get("bar") { SessionStorage sessionStorage ->
-        sessionStorage.get("value", String).then({
+      get("bar") { SessionAdapter session ->
+        session.get("value").then {
           render it.orElse("null")
-        })
+        }
       }
-      get("") { SessionStorage sessionStorage ->
-        sessionStorage.get("value", String).then({
+      get("") { SessionAdapter session ->
+        session.get("value").then {
           render it.orElse("null")
-        })
+        }
       }
-      get("val/:value") { SessionStorage sessionStorage ->
-        sessionStorage.set("value", pathTokens.value).then({
-          sessionStorage.get("value", String).then({
+      get("val/:value") { SessionAdapter session ->
+        session.set("value", pathTokens.value).then {
+          session.get("value").then {
             render it.orElse("null")
-          })
-        })
+          }
+        }
       }
     }
 
@@ -148,30 +150,30 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
   def "cookie is send in request for the given path only"() {
     given:
     bindings {
-      module ClientSideSessionsModule, {
+      module NewClientSideSessionModule, {
         it.with {
           path = "/foo"
         }
       }
     }
     handlers {
-      get("/foo/:value") { SessionStorage sessionStorage ->
+      get("/foo/:value") { SessionAdapter session ->
         if (pathTokens.value == "check") {
-          sessionStorage.get("value", String).then({
+          session.get("value").then {
             render it.orElse("null")
-          })
+          }
         } else {
-          sessionStorage.set("value", pathTokens.value).then({
-            sessionStorage.get("value", String).then({
+          session.set("value", pathTokens.value).then {
+            session.get("value").then {
               render it.orElse("null")
-            })
-          })
+            }
+          }
         }
       }
-      get("/bar") { SessionStorage sessionStorage ->
-        sessionStorage.get("value", String).then({
+      get("/bar") { SessionAdapter session ->
+        session.get("value").then {
           render it.orElse("null")
-        })
+        }
       }
     }
 
@@ -238,25 +240,31 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
     attrs.size() == 0
   }
 
+  public static class SessionKeys {
+    Map<String, String> strings = Maps.newHashMap()
+    Map<Class<?>, Object> objects = Maps.newHashMap()
+  }
+
   def "removed session attribute does not clear the other attributes"() {
     bindings {
-      module ClientSideSessionsModule, {
+      module NewClientSideSessionModule, {
         it.with {
           secretKey = "aaaaaaaaaaaaaaaa"
         }
       }
+      bindInstance(SessionKeys, new SessionKeys())
     }
-    def clientSessionService = null
+    Registry reg
     handlers {
-      if (!clientSessionService) {
-        clientSessionService = new SessionServiceWrapper(registry)
+      if (!reg) {
+        reg = registry
       }
-      get("s/:attr/:value") { SessionStorage sessionStorage ->
+      get("s/:attr/:value") { SessionAdapter session ->
         String attr = pathTokens.attr
         String value = pathTokens.value
         if (attr && value) {
-          sessionStorage.set(attr, value).then {
-            sessionStorage.get(attr, Object).then {
+          session.set(attr, value).then {
+            session.get(attr).then {
               render "ATTR: ${attr} VALUE: ${it.get()}"
             }
           }
@@ -264,15 +272,30 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
           clientError(404)
         }
       }
-      get("clear/:attr") { SessionStorage sessionStorage ->
+      get("sessionvalues") { SessionAdapter session, SessionKeys sessionKeys ->
+        session.getStringKeys().then { keys ->
+          sessionKeys.strings.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { key ->
+            session.get(key).then { value ->
+              sessionKeys.strings[key] = value.orElse("null")
+              if (count.decrementAndGet() == 0) {
+                render ""
+              }
+            }
+
+          }
+        }
+      }
+      get("clear/:attr") { SessionAdapter session ->
         String attr = pathTokens.attr
         if (attr) {
-          sessionStorage.remove(attr).then({
-            sessionStorage.get(attr, String).onError({th ->
+          session.remove(attr).then({
+            session.get(attr).onError {th ->
               render "null"
-            }).then({
+            }.then {
               render it.orElse("null")
-            })
+            }
           })
         } else {
           clientError(404)
@@ -284,58 +307,80 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
     get("s/foo/bar")
     get("s/baz/quux")
     String[] setCookies = getSessionCookies("/")
-    def attrs = getSessionAttrs(clientSessionService, "/")
+    get("sessionvalues")
 
     then:
+    SessionKeys sessionKeys = reg.get(SessionKeys)
+    sessionKeys
     setCookies.length == 1
-    attrs.size() == 2
-    attrs["foo"] == "bar"
-    attrs["baz"] == "quux"
+
+    sessionKeys.strings.size() == 2
+    sessionKeys.strings["foo"] == "bar"
+    sessionKeys.strings["baz"] == "quux"
 
     when:
     get("clear/foo")
-    setCookies = getSessionAttrs(clientSessionService, "/")
-    attrs = getSessionAttrs(clientSessionService, "/")
+    setCookies = getSessionCookies("/")
+    get("sessionvalues")
 
     then:
     setCookies.length == 1
-    attrs.size() == 1
-    !attrs["foo"]
-    attrs["baz"] == "quux"
+    sessionKeys.strings.size() == 1
+    !sessionKeys.strings["foo"]
+    sessionKeys.strings["baz"] == "quux"
   }
 
   def "large session partitioned into many session cookies - values serialized as string"() {
     bindings {
-      module ClientSideSessionsModule, {
+      module NewClientSideSessionModule, {
         it.with {
           secretKey = "aaaaaaaaaaaaaaaa"
-          valueSerializer = new StringValueSerializer()
         }
       }
+      bindInstance(SessionKeys, new SessionKeys())
     }
 
+    Registry reg
     handlers {
-      get("set") { SessionStorage sessionStorage ->
+      if (!reg) {
+        reg = registry
+      }
+      get("set") { SessionAdapter session ->
         String value = ""
         for (int i = 0; i < 800/*1024*/; i++) {
           value += "ab"
         }
-        sessionStorage.set("foo", value).then {
-          sessionStorage.get("foo", String).then {
+        session.set("foo", value).then {
+          session.get("foo").then {
             render "SET"
           }
         }
       }
-      get("setsmall") { SessionStorage sessionStorage ->
-        sessionStorage.set("foo", "val1").then {
-          sessionStorage.get("foo", String).then {
+      get("setsmall") { SessionAdapter session ->
+        session.set("foo", "val1").then {
+          session.get("foo").then {
             render it.orElse("null")
           }
         }
       }
-      get("clear") { SessionStorage sessionStorage ->
-        sessionStorage.remove("foo").then {
+      get("clear") { SessionAdapter session ->
+        session.remove("foo").then {
           render ""
+        }
+      }
+      get("sessionvalues") { SessionAdapter session, SessionKeys sessionKeys ->
+        session.getStringKeys().then { keys ->
+          sessionKeys.strings.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { key ->
+            session.get(key).then { value ->
+              sessionKeys.strings[key] = value.orElse("null")
+              if (count.decrementAndGet() == 0) {
+                render "FINISHED TEST"
+              }
+            }
+
+          }
         }
       }
     }
@@ -356,7 +401,10 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
     get("clear")
 
     then:
-    getCookies("/").size() == 0
+    getCookies("/").size() == 1
+    SessionKeys sessionKeys = reg.get(SessionKeys)
+    sessionKeys
+    sessionKeys.strings.size() == 0
 
     when:
     get("set")
@@ -366,78 +414,14 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
 
     when:
     get("clear")
-
-    then:
-    getCookies("/").size() == 0
-  }
-
-  def "large session partitioned into many session cookies - values serialized as java objects"() {
-    bindings {
-      module ClientSideSessionsModule, {
-        it.with {
-          secretKey = "aaaaaaaaaaaaaaaa"
-          valueSerializer = new JavaValueSerializer()
-        }
-      }
-    }
-
-    handlers {
-      get("set") { SessionStorage sessionStorage ->
-        String value = ""
-        for (int i = 0; i < 800/*1024*/; i++) {
-          value += "ab"
-        }
-        sessionStorage.set("foo", value).then({
-          sessionStorage.get("foo", String).then({
-            render "SET"
-          })
-        })
-      }
-      get("setsmall") { SessionStorage sessionStorage ->
-        sessionStorage.set("foo", "val1").then {
-          sessionStorage.get("foo", String).then {
-            render it.orElse("null")
-          }
-        }
-      }
-      get("clear") { SessionStorage sessionStorage ->
-        sessionStorage.remove("foo").then {
-          render ""
-        }
-      }
-    }
-
-    when:
-    get("set")
-
-    then:
-    getCookies("/").size() == 2
-
-    when:
-    get("setsmall")
+    get("sessionvalues")
 
     then:
     getCookies("/").size() == 1
-
-    when:
-    get("clear")
-
-    then:
-    getCookies("/").size() == 0
-
-    when:
-    get("set")
-
-    then:
-    getCookies("/").size() == 2
-
-    when:
-    get("clear")
-
-    then:
-    getCookies("/").size() == 0
+    sessionKeys.strings.size() == 0
   }
 
+  @Ignore
   def "session last access time is defined"() {
     bindings {
       module ClientSideSessionsModule, {
@@ -475,6 +459,7 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
     lastAccessTime > 0
   }
 
+  @Ignore
   def "timed out session returns changed attribute"() {
     bindings {
       module ClientSideSessionsModule, {
@@ -536,6 +521,7 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
     lastAccessTime > -1
   }
 
+  @Ignore
   def "timed out session does not return expired attributes"() {
     bindings {
       module ClientSideSessionsModule, {
@@ -593,102 +579,139 @@ class ClientSideSessionCookiesSpec extends RatpackGroovyDslSpec {
     lastAccessTime == -1
   }
 
+  public static class FooSessionAttribute implements Serializable {
+    String value
+  }
+
   def "serialization of Integer returns Integer"() {
     bindings {
-      module ClientSideSessionsModule, {
+      module NewClientSideSessionModule, {
         it.with {
           secretKey = "aaaaaaaaaaaaaaaa"
-          valueSerializer = new JavaValueSerializer()
         }
       }
+      bindInstance(SessionKeys, new SessionKeys())
     }
 
-    def clientSessionService = null
+    Registry reg
     handlers {
-      if (!clientSessionService) {
-        clientSessionService = new SessionServiceWrapper(registry)
+      if (!reg) {
+        reg = registry
       }
-      get("") { SessionStorage sessionStorage ->
+      get("") { SessionAdapter session ->
         render "null"
       }
-      get("s/:attr") { SessionStorage sessionStorage ->
+      get("s/:attr") { SessionAdapter session ->
         String attr = pathTokens.attr
         if (attr) {
-          sessionStorage.set(attr, Integer.valueOf(10)).then({
-            sessionStorage.get(attr, Integer).then({
-              render "ATTR: ${attr} VALUE: ${it.orElse(null)}"
-            })
-          })
+          session.set(Integer.valueOf(10)).then {
+            render ""
+          }
         } else {
           clientError(404)
+        }
+      }
+      get("sessionvalues") { SessionAdapter session, SessionKeys sessionKeys ->
+        session.getTypeKeys().then { keys ->
+          sessionKeys.objects.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { type ->
+            session.get(type).then { value ->
+              sessionKeys.objects[type] = value.orElse(null)
+              if (count.decrementAndGet() == 0) {
+                render ""
+              }
+            }
+          }
         }
       }
     }
 
     when:
     get("s/foo")
-    def attrs = getSessionAttrs(clientSessionService, "/")
+    get("sessionvalues")
 
     then:
-    attrs["foo"] instanceof Integer
-    attrs["foo"] == 10
+    SessionKeys sessionKeys = reg.get(SessionKeys)
+    sessionKeys
+    sessionKeys.objects.size() == 1
+    sessionKeys.objects[Integer]
+    sessionKeys.objects[Integer] instanceof Integer
+    sessionKeys.objects[Integer] == 10
   }
 
   def "serialization of custom class returns its instance"() {
     bindings {
-      module ClientSideSessionsModule, {
+      module NewClientSideSessionModule, {
         it.with {
           secretKey = "aaaaaaaaaaaaaaaa"
-          valueSerializer = new JavaValueSerializer()
         }
       }
+      bindInstance(SessionKeys, new SessionKeys())
     }
 
-    def clientSessionService = null
+    Registry reg
     handlers {
-      if (!clientSessionService) {
-        clientSessionService = new SessionServiceWrapper(registry)
+      if (!reg) {
+        reg = registry
       }
-      get("") { SessionStorage sessionStorage ->
+      get("") { SessionAdapter session ->
         render "null"
       }
-      get("s/foo") { SessionStorage sessionStorage ->
+      get("s/foo") { SessionAdapter session ->
         SerializableTypes.TypeA t = new SerializableTypes.TypeA()
         t.valueInt = Integer.valueOf(10)
         t.valueDouble = Double.valueOf(10.123)
-        sessionStorage.set("foo", t).then({
+        session.set(t).then {
           render "ATTR: foo"
-        })
+        }
       }
-      get("s/bar") { SessionStorage sessionStorage ->
+      get("s/bar") { SessionAdapter session ->
         SerializableTypes.TypeA ta = new SerializableTypes.TypeA()
         ta.valueInt = Integer.valueOf(20)
         ta.valueDouble = Double.valueOf(20.123)
         SerializableTypes.TypeB tb = new SerializableTypes.TypeB()
         tb.valueStr = "BAR"
         tb.typeA = ta
-        sessionStorage.set("bar", tb).then({
+        session.set(tb).then {
           render "ATTR: bar"
-        })
+        }
+      }
+      get("sessionvalues") { SessionAdapter session, SessionKeys sessionKeys ->
+        session.getTypeKeys().then { keys ->
+          sessionKeys.objects.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { type ->
+            session.get(type).then { value ->
+              sessionKeys.objects[type] = value.orElse(null)
+              if (count.decrementAndGet() == 0) {
+                render ""
+              }
+            }
+          }
+        }
       }
     }
 
     when:
     get("s/foo")
     get("s/bar")
-    def attrs = getSessionAttrs(clientSessionService, "/")
+    get("sessionvalues")
+    SessionKeys sessionKeys = reg.get(SessionKeys)
 
     then:
-    attrs["foo"] instanceof SerializableTypes.TypeA
-    with(attrs["foo"]) {
+    sessionKeys
+    sessionKeys.objects.size() == 2
+    sessionKeys.objects[SerializableTypes.TypeA] instanceof SerializableTypes.TypeA
+    with(sessionKeys.objects[SerializableTypes.TypeA]) {
       valueInt instanceof Integer
       valueDouble instanceof Double
 
       valueInt == Integer.valueOf(10)
       valueDouble == Double.valueOf(10.123)
     }
-    attrs["bar"] instanceof SerializableTypes.TypeB
-    with(attrs["bar"]) {
+    sessionKeys.objects[SerializableTypes.TypeB] instanceof SerializableTypes.TypeB
+    with (sessionKeys.objects[SerializableTypes.TypeB]) {
       valueStr == "BAR"
       typeA instanceof SerializableTypes.TypeA
       typeA.valueInt == 20

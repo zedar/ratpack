@@ -16,24 +16,23 @@
 
 package ratpack.session.clientside
 
+import com.google.common.collect.Maps
 import io.netty.handler.codec.http.QueryStringDecoder
 import io.netty.util.CharsetUtil
 import ratpack.groovy.test.embed.GroovyEmbeddedApp
 import ratpack.http.MutableHeaders
 import ratpack.http.client.RequestSpec
 import ratpack.http.internal.HttpHeaderConstants
-import ratpack.session.clientside.serializer.StringValueSerializer
-import ratpack.session.store.SessionStorage
+import ratpack.session.SessionAdapter
 import ratpack.test.internal.RatpackGroovyDslSpec
 import spock.lang.Unroll
+
+import java.util.concurrent.atomic.AtomicInteger
 
 class ClientSideSessionSpec extends RatpackGroovyDslSpec {
 
   def setup() {
-    def m = new ClientSideSessionsModule()
-    def c = new ClientSideSessionsModule.Config()
-    c.valueSerializer = new StringValueSerializer()
-    m.setConfig(c)
+    def m = new NewClientSideSessionModule()
     modules << m
   }
 
@@ -63,10 +62,15 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
     URLDecoder.decode(s, "utf-8")
   }
 
+  private static class SessionKeys {
+    Map<String, String> strings = Maps.newHashMap()
+    Map<Class<?>, Object> objects = Maps.newHashMap()
+  }
+
   def "new session with no entries should not set cookie"() {
     given:
     handlers {
-      get { SessionStorage storage ->
+      get { SessionAdapter storage ->
         response.send "ok"
       }
     }
@@ -80,19 +84,36 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
 
   def "can store session vars"() {
     given:
+    SessionKeys sessionKeys = new SessionKeys()
+    bindings {
+      bindInstance(SessionKeys, sessionKeys)
+    }
     handlers {
-      get("") { SessionStorage storage ->
-        storage.get("value", String).then({
+      get("") { SessionAdapter storage ->
+        storage.get("value").then {
           render it.orElse("null")
-        })
+        }
       }
-      get("set/:value") { SessionStorage storage ->
-        storage.set("value", pathTokens.value).then({
-
-          storage.get("value", String).then({
+      get("set/:value") { SessionAdapter storage ->
+        storage.set("value", pathTokens.value).then {
+          storage.get("value").then {
             render it.orElse("null")
-          })
-        })
+          }
+        }
+      }
+      get("session") { SessionAdapter session, SessionKeys sk ->
+        session.getStringKeys().then { keys ->
+          sk.strings.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { key ->
+            session.get(key).then { value ->
+              sk.strings.put(key, value.orElse("null"))
+              if (count.decrementAndGet() == 0) {
+                render ""
+              }
+            }
+          }
+        }
       }
     }
 
@@ -106,29 +127,46 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
 
     and:
     getText("set/foo") == "foo"
-    decodedPairs.value == "foo"
-
+    get("session")
+    sessionKeys.strings.size() == 1
+    sessionKeys.strings["value"] == "foo"
   }
 
   @Unroll('key #key and value #value should be encoded')
   def "can handle keys/values that should be encoded"() {
     given:
+    SessionKeys sessionKeys = new SessionKeys()
+    bindings {
+      bindInstance(SessionKeys, sessionKeys)
+    }
     handlers {
-      get { SessionStorage storage ->
-        storage.set(key, value).then({
-
-          storage.get(key, String).then({
+      get { SessionAdapter storage ->
+        storage.set(key, value).then {
+          storage.get(key).then {
             response.send it.orElse("null")
-          })
-
-        })
-
+          }
+        }
+      }
+      get("session") { SessionAdapter session, SessionKeys sk ->
+        session.getStringKeys().then { keys ->
+          sk.strings.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { key ->
+            session.get(key).then { value ->
+              sk.strings.put(key, value.orElse("null"))
+              if (count.decrementAndGet() == 0) {
+                render ""
+              }
+            }
+          }
+        }
       }
     }
 
     expect:
     getText() == value
-    decodedPairs[key] == value
+    get("session")
+    sessionKeys.strings[key] == value
 
     where:
     key   | value
@@ -142,27 +180,41 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
 
   }
 
-
   def "client should set-cookie only when session values have changed"() {
     given:
+    SessionKeys sessionKeys = new SessionKeys()
+    bindings {
+      bindInstance(SessionKeys, sessionKeys)
+    }
     handlers {
-
-      handler { SessionStorage storage ->
+      handler { SessionAdapter storage ->
         next()
       }
-
-      get("") { SessionStorage storage ->
-        storage.get("value", String).then({
+      get("") { SessionAdapter storage ->
+        storage.get("value").then {
           render it.orElse("null")
-        })
+        }
       }
-      get("set/:value") { SessionStorage storage ->
-        storage.set("value", pathTokens.value).then({
-
-          storage.get("value", String).then({
+      get("set/:value") { SessionAdapter storage ->
+        storage.set("value", pathTokens.value).then {
+          storage.get("value").then {
             render it.orElse("null")
-          })
-        })
+          }
+        }
+      }
+      get("session") { SessionAdapter session, SessionKeys sk ->
+        session.getStringKeys().then { keys ->
+          sk.strings.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { key ->
+            session.get(key).then { value ->
+              sk.strings.put(key, value.orElse("null"))
+              if (count.decrementAndGet() == 0) {
+                render ""
+              }
+            }
+          }
+        }
       }
     }
 
@@ -174,57 +226,79 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
     getText("set/foo")
     response.body.text == "foo"
     setCookie.startsWith("ratpack_session")
-    decodedPairs.value == "foo"
+    get("session")
+    sessionKeys.strings["value"] == "foo"
 
     getText("")
     response.body.text == "foo"
     setCookie == null
-    decodedPairs.value == "foo"
+    get("session")
+    sessionKeys.strings["value"] == "foo"
 
     getText("set/foo")
     response.body.text == "foo"
     setCookie == null
-    decodedPairs.value == "foo"
+    get("session")
+    sessionKeys.strings["value"] == "foo"
 
     getText("set/bar")
     response.body.text == "bar"
     setCookie.startsWith("ratpack_session")
-    decodedPairs.value == "bar"
+    get("session")
+    sessionKeys.strings["value"] == "bar"
 
     getText("set/bar")
     response.body.text == "bar"
     setCookie == null
-    decodedPairs.value == "bar"
-
+    get("session")
+    sessionKeys.strings["value"] == "bar"
   }
 
   def "clearing an existing session informs client to expire cookie"() {
     given:
+    SessionKeys sessionKeys = new SessionKeys()
+    bindings {
+      bindInstance(SessionKeys, sessionKeys)
+    }
     handlers {
-      get("") { SessionStorage storage ->
-        storage.get("value", String).then({
+      get("") { SessionAdapter storage ->
+        storage.get("value", String).then {
           render it.orElse("null")
-        })
+        }
       }
-      get("set/:value") { SessionStorage storage ->
-        storage.set("value", pathTokens.value).then({
-          storage.get("value", String).then({
+      get("set/:value") { SessionAdapter storage ->
+        storage.set("value", pathTokens.value).then {
+          storage.get("value", String).then {
             render it.orElse("null")
-          })
-        })
+          }
+        }
       }
-      get("clear") { SessionStorage storage ->
-        storage.clear().then({
+      get("clear") { SessionAdapter storage ->
+        storage.terminate().then {
           render "OK"
-        })
+        }
+      }
+      get("session") { SessionAdapter session, SessionKeys sk ->
+        session.getStringKeys().then { keys ->
+          sk.strings.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { key ->
+            session.get(key).then { value ->
+              sk.strings.put(key, value.orElse("null"))
+              if (count.decrementAndGet() == 0) {
+                render ""
+              }
+            }
+          }
+        }
       }
     }
 
     when:
     get("set/foo")
-
+    get("session")
     then:
-    decodedPairs.value == "foo"
+    sessionKeys.strings.value == "foo"
 
     when:
     get("clear")
@@ -247,11 +321,10 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
   def "a malformed cookie (#value) results in an empty session"() {
     given:
     handlers {
-      get { SessionStorage storage ->
-        storage.getKeys().then({ keys ->
+      get { SessionAdapter storage ->
+        storage.getStringKeys().then { keys ->
           response.send(keys.isEmpty().toString())
-        })
-
+        }
       }
     }
 
@@ -275,10 +348,10 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
   def "a cookie with bad digest results in empty session"() {
     given:
     handlers {
-      get { SessionStorage storage ->
-        storage.getKeys().then({ keys ->
+      get { SessionAdapter storage ->
+        storage.getStringKeys().then { keys ->
           response.send(keys.isEmpty().toString())
-        })
+        }
       }
     }
 
@@ -293,29 +366,27 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
 
     then:
     response.body.text == "true"
-
   }
 
   def aut(Closure sessionModuleConfig) {
     GroovyEmbeddedApp.build {
       bindings {
-        module ClientSideSessionsModule, {
+        module NewClientSideSessionModule, {
           it.with sessionModuleConfig
         }
       }
       handlers {
-        get { SessionStorage storage ->
-          storage.get("value", String).then({
+        get { SessionAdapter storage ->
+          storage.get("value").then {
             render it.orElse("null")
-          })
+          }
         }
-        get("set/:value") { SessionStorage storage ->
-          storage.set("value", pathTokens.value).then({
-
-            storage.get("value", String).then({
+        get("set/:value") { SessionAdapter storage ->
+          storage.set("value", pathTokens.value).then {
+            storage.get("value").then {
               render it.orElse("null")
-            })
-          })
+            }
+          }
         }
       }
     }
@@ -353,13 +424,13 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
     sessionModuleConfig << [
       {
         secretToken = "secret"
-        sessionName = "_sess"
+        sessionCookieName = "_sess"
         macAlgorithm = "HmacMD5"
       },
       {
         secretToken = "secret"
         secretKey = "a" * 16
-        sessionName = "_sess"
+        sessionCookieName = "_sess"
         macAlgorithm = "HmacMD5"
       }
     ]
@@ -370,24 +441,23 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
     given:
     modules.clear()
     bindings {
-      module ClientSideSessionsModule, {
+      module NewClientSideSessionModule, {
         it.secretKey = "a" * 16
-        it.valueSerializer = new StringValueSerializer()
       }
     }
 
     handlers {
-      get("") { SessionStorage storage ->
-        storage.get("value", String).then({
+      get("") { SessionAdapter storage ->
+        storage.get("value").then {
           render it.orElse("null")
-        })
+        }
       }
-      get("set/:value") { SessionStorage storage ->
-        storage.set("value", pathTokens.value).then({
-          storage.get("value", String).then({
+      get("set/:value") { SessionAdapter storage ->
+        storage.set("value", pathTokens.value).then {
+          storage.get("value").then {
             render it.orElse("null")
-          })
-        })
+          }
+        }
       }
     }
 
@@ -410,9 +480,10 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
   @Unroll
   def "secretKey with #algorithm renders session unreadable"() {
     given:
+    SessionKeys sessionKeys = new SessionKeys()
     modules.clear()
     bindings {
-      module ClientSideSessionsModule, {
+      module NewClientSideSessionModule, {
         it.with {
           int length = 16
           switch (algorithm) {
@@ -428,24 +499,37 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
           }
           secretKey = "a" * length
           cipherAlgorithm = algorithm
-          valueSerializer = new StringValueSerializer()
         }
       }
+      bindInstance(SessionKeys, sessionKeys)
     }
 
     handlers {
-      get("") { SessionStorage storage ->
-        storage.get("value", String).then({
+      get("") { SessionAdapter storage ->
+        storage.get("value").then {
           render it.orElse("null")
-        })
+        }
       }
-      get("set/:value") { SessionStorage storage ->
-        storage.set("value", pathTokens.value).then({
-
-          storage.get("value", String).then({
+      get("set/:value") { SessionAdapter storage ->
+        storage.set("value", pathTokens.value).then {
+          storage.get("value").then {
             render it.orElse("null")
-          })
-        })
+          }
+        }
+      }
+      get("session") { SessionAdapter session, SessionKeys sk ->
+        session.getStringKeys().then { keys ->
+          sk.strings.clear()
+          AtomicInteger count = new AtomicInteger(keys.size())
+          keys.forEach { key ->
+            session.get(key).then { value ->
+              sk.strings.put(key, value.orElse("null"))
+              if (count.decrementAndGet() == 0) {
+                render ""
+              }
+            }
+          }
+        }
       }
     }
 
@@ -456,16 +540,21 @@ class ClientSideSessionSpec extends RatpackGroovyDslSpec {
     !setCookie
 
     getText("set/foo") == "foo"
-    sessionPayload
-    String payload
-    try {
-      payload = new String(Base64.getUrlDecoder().decode(sessionPayload.bytes), CharsetUtil.UTF_8)
-      QueryStringDecoder queryStringDecoder = new QueryStringDecoder(payload, CharsetUtil.UTF_8, false)
-      queryStringDecoder.parameters().every { key, value ->
-        key != "value" && value != "foo"
-      }
-    } catch (Exception e) {
+    get("session")
+    sessionKeys.strings.every { key, value ->
+      key == "value" && value == "foo"
     }
+
+//    sessionPayload
+//    String payload
+//    try {
+//      payload = new String(Base64.getUrlDecoder().decode(sessionPayload.bytes), CharsetUtil.UTF_8)
+//      QueryStringDecoder queryStringDecoder = new QueryStringDecoder(payload, CharsetUtil.UTF_8, false)
+//      queryStringDecoder.parameters().every { key, value ->
+//        key != "value" && value != "foo"
+//      }
+//    } catch (Exception e) {
+//    }
 
     getText() == "foo"
 

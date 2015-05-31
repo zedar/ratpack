@@ -19,6 +19,7 @@ package ratpack.session.clientside.internal;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.base64.Base64;
 import io.netty.handler.codec.base64.Base64Dialect;
 import io.netty.handler.codec.http.Cookie;
@@ -77,18 +78,20 @@ public class DefaultClientSideSessionStoreAdapter implements SessionStoreAdapter
    * @param sessionId cookie based session does not have id
    * @param bufferAllocator the buffer allocator
    * @param sessionData the serialized session data
-   * @return the promise for the result of saving the session data in cookies
+   * @return the promise for the info if old cookies have been changed
    */
   @Override
   public Promise<Boolean> store(SessionId sessionId, ByteBufAllocator bufferAllocator, ByteBuf sessionData) {
     return execControl.promiseFrom(() -> {
+      int oldSessionCookiesCount = getSessionCookies().length;
       String[] sessionCookiePartitions = serialize(bufferAllocator, sessionData);
       for (int i = 0; i < sessionCookiePartitions.length; i++) {
         addSessionCookie(config.getSessionCookieName() + "_" + i, sessionCookiePartitions[i]);
       }
-      for (int i = sessionCookiePartitions.length; i < getSessionCookies().length; i++) {
+      for (int i = sessionCookiePartitions.length; i < oldSessionCookiesCount; i++) {
         invalidateSessionCookie(config.getSessionCookieName() + "_" + i);
       }
+      return oldSessionCookiesCount > 0;
     });
   }
 
@@ -101,7 +104,9 @@ public class DefaultClientSideSessionStoreAdapter implements SessionStoreAdapter
    */
   @Override
   public Promise<ByteBuf> load(SessionId sessionId, ByteBufAllocator bufferAllocator) {
-    return null;
+    return execControl.promiseFrom(() -> {
+      return deserialize(bufferAllocator, getSessionCookies());
+    });
   }
 
   /**
@@ -112,7 +117,13 @@ public class DefaultClientSideSessionStoreAdapter implements SessionStoreAdapter
    */
   @Override
   public Promise<Boolean> remove(SessionId sessionId) {
-    return null;
+    return execControl.promiseFrom(() -> {
+      int oldSessionCookiesCount = getSessionCookies().length;
+      for (int i = 0; i < oldSessionCookiesCount; i++) {
+        invalidateSessionCookie(config.getSessionCookieName() + "_" + i);
+      }
+      return oldSessionCookiesCount > 0;
+    });
   }
 
   /**
@@ -122,30 +133,85 @@ public class DefaultClientSideSessionStoreAdapter implements SessionStoreAdapter
    */
   @Override
   public long size() {
-    return -1;
+    if (getSessionCookies().length > 0) {
+      return 1;
+    } else {
+      return 0;
+    }
   }
 
   private String[] serialize(ByteBufAllocator bufferAllocator, ByteBuf sessionData) {
-    ByteBuf encrypted = crypto.encrypt(sessionData, bufferAllocator);
-    String encryptedBase64 = toBase64(encrypted);
-    ByteBuf digest = signer.sign(encrypted.resetReaderIndex(), bufferAllocator);
-    String digestBase64 = toBase64(digest);
-
-    digest.release();
-    encrypted.release();
-
-    String digestedBase64 = encryptedBase64 + SESSION_SEPARATOR + digestBase64;
-    if (digestedBase64.length() <= config.getMaxSessionCookieSize()) {
-      return new String[]{digestedBase64};
+    if (sessionData == null || sessionData.readableBytes() == 0) {
+      return new String[0];
     }
-    int count = (int) Math.ceil((double) digestedBase64.length() / config.getMaxSessionCookieSize());
-    String[] partitions = new String[count];
-    for (int i = 0; i < count; i++) {
-      int from = i * config.getMaxSessionCookieSize();
-      int to = Math.min(from + config.getMaxSessionCookieSize(), digestedBase64.length());
-      partitions[i] = digestedBase64.substring(from, to);
+
+    ByteBuf encrypted = null;
+    ByteBuf digest = null;
+
+    try {
+      encrypted = crypto.encrypt(sessionData, bufferAllocator);
+      String encryptedBase64 = toBase64(encrypted);
+      digest = signer.sign(encrypted.resetReaderIndex(), bufferAllocator);
+      String digestBase64 = toBase64(digest);
+      String digestedBase64 = encryptedBase64 + SESSION_SEPARATOR + digestBase64;
+      if (digestedBase64.length() <= config.getMaxSessionCookieSize()) {
+        return new String[]{digestedBase64};
+      }
+      int count = (int) Math.ceil((double) digestedBase64.length() / config.getMaxSessionCookieSize());
+      String[] partitions = new String[count];
+      for (int i = 0; i < count; i++) {
+        int from = i * config.getMaxSessionCookieSize();
+        int to = Math.min(from + config.getMaxSessionCookieSize(), digestedBase64.length());
+        partitions[i] = digestedBase64.substring(from, to);
+      }
+      return partitions;
+    } finally {
+      if (encrypted != null) {
+        encrypted.release();
+      }
+      if (digest != null) {
+        digest.release();
+      }
     }
-    return partitions;
+  }
+
+  private ByteBuf deserialize(ByteBufAllocator bufferAllocator, Cookie[] sessionCookies) {
+    if (sessionCookies.length == 0) {
+      return Unpooled.buffer(0, 0);
+    }
+    StringBuilder sessionCookie = new StringBuilder();
+    for (int i = 0; i < sessionCookies.length; i++) {
+      sessionCookie.append(sessionCookies[i].value());
+    }
+    String[] parts = sessionCookie.toString().split(SESSION_SEPARATOR);
+    if (parts.length != 2) {
+      return Unpooled.buffer(0, 0);
+    }
+    ByteBuf payload = null;
+    ByteBuf digest = null;
+    ByteBuf expectedDigest = null;
+    ByteBuf decryptedPayload = null;
+    try {
+      payload = fromBase64(bufferAllocator, parts[0]);
+      digest = fromBase64(bufferAllocator, parts[1]);
+      expectedDigest = signer.sign(payload, bufferAllocator);
+      if (ByteBufUtil.equals(digest, expectedDigest)) {
+        decryptedPayload = crypto.decrypt(payload.resetReaderIndex(), bufferAllocator);
+      } else {
+        decryptedPayload = Unpooled.buffer(0, 0);
+      }
+    } finally {
+      if (payload != null) {
+        payload.release();
+      }
+      if (digest != null) {
+        digest.release();
+      }
+      if (expectedDigest != null) {
+        expectedDigest.release();
+      }
+    }
+    return decryptedPayload;
   }
 
   private String toBase64(ByteBuf byteBuf) {
@@ -168,7 +234,7 @@ public class DefaultClientSideSessionStoreAdapter implements SessionStoreAdapter
 
   private Cookie[] getSessionCookies() {
     Set<Cookie> cookies = request.getCookies();
-    if (cookies == null) {
+    if (cookies == null || cookies.size() == 0) {
       return new Cookie[0];
     }
     return cookies

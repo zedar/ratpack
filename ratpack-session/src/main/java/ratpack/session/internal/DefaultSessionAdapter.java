@@ -106,7 +106,7 @@ public class DefaultSessionAdapter implements SessionAdapter {
   }
 
   private ByteBuf serialize() {
-    Data data = new Data(ImmutableMap.copyOf(strings), ImmutableMap.copyOf(objects));
+    Data data = new Data(strings.isEmpty() ? Maps.newHashMap() : ImmutableMap.copyOf(strings), ImmutableMap.copyOf(objects));
     ByteBuf buffer = bufferAllocator.buffer();
     OutputStream outputStream = new ByteBufOutputStream(buffer);
     try {
@@ -168,8 +168,11 @@ public class DefaultSessionAdapter implements SessionAdapter {
 
     @Override
     public boolean set(String key, String value) {
-      markDirty();
-      return strings.put(key, value) != null;
+      String prev = strings.put(key, value);
+      if (prev == null || prev != null && !prev.equals(value)) {
+        markDirty();
+      }
+      return prev != null;
     }
 
     @Override

@@ -1,3 +1,19 @@
+/*
+ * Copyright 2014 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package ratpack.session.clientside;
 
 import java.time.Duration;
@@ -29,7 +45,7 @@ public interface ClientSideSessionConfig {
    * <p>
    * If not set, this is set to a time based value.
    * <p>
-   * <b>Important: </b></> if working with clustered sessions, not being tied to any ratpack app instance,
+   * <b>Important: </b> if working with clustered sessions, not being tied to any ratpack app instance,
    * {@code secretToken} has to be the same in every ratpack instance configuration.
    *
    * @return the token used to sign the serialized and encrypted session.
@@ -66,7 +82,7 @@ public interface ClientSideSessionConfig {
 
   /**
    * Set the secret key used in the symmetric-key encryption/decryption of the serialized session data.
-   * @param secretKey
+   * @param secretKey a secret key
    */
   void setSecretKey(String secretKey);
 
